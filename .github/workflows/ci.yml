@@ -1,0 +1,232 @@
+# CI/CD Workflow for Nix + Turborepo Monorepo
+#
+# This workflow demonstrates:
+# - Building only changed apps using Turborepo
+# - Building OCI images with Nix (no Docker required!)
+# - Pushing images to GitHub Container Registry using skopeo
+# - Generating image digests for deployment
+#
+# Key Features:
+# - Fast: Uses Turborepo caching and Nix binary cache
+# - Deterministic: Nix ensures reproducible builds
+# - Docker-free: Uses skopeo for OCI image operations
+# - Secure: Uses GITHUB_TOKEN for registry authentication
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  # Configure where to push images
+  # Change this to your registry (ECR, GCR, Docker Hub, etc.)
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # Job 1: Build and test changed applications
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout with full history for Turborepo change detection
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for turbo --since
+
+      # Install Nix using Determinate Systems installer (recommended)
+      # This provides better caching and is faster than the official action
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v13
+
+      # Optional: Enable Nix binary cache for faster builds
+      # This caches Nix build artifacts to speed up subsequent builds
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      # Cache Turborepo build artifacts
+      # This speeds up builds by reusing previous build outputs
+      - name: Cache Turbo
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('**/package.json', '**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      # Install pnpm globally
+      # pnpm is faster and more space-efficient than npm
+      - name: Install pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@latest --activate
+
+      # Install dependencies
+      # --frozen-lockfile ensures we use exact versions from the lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build only changed apps since the base branch
+      # Turborepo automatically detects changes and builds only what's needed
+      - name: Build changed apps
+        run: |
+          pnpm turbo build \
+            --filter="...[origin/${{ github.base_ref || 'main' }}]" \
+            --output-logs=new-only
+
+      # Run tests for changed apps
+      - name: Test changed apps
+        run: |
+          pnpm turbo test \
+            --filter="...[origin/${{ github.base_ref || 'main' }}]" \
+            --output-logs=errors-only
+
+      # Lint changed apps
+      - name: Lint changed apps
+        run: |
+          pnpm turbo lint \
+            --filter="...[origin/${{ github.base_ref || 'main' }}]" \
+            --output-logs=errors-only
+
+      # Build OCI images with Nix for changed apps
+      # This creates reproducible, Docker-free images
+      - name: Build OCI images
+        run: |
+          # Detect which apps changed and build their images
+          echo "Detecting changed apps..."
+
+          if git diff --name-only origin/${{ github.base_ref || 'main' }}...HEAD | grep -q '^apps/web/'; then
+            echo "Building web image..."
+            nix build .#image-web -L
+            mv result result-web
+            echo "web" >> .apps-built
+          fi
+
+          if git diff --name-only origin/${{ github.base_ref || 'main' }}...HEAD | grep -q '^apps/api/'; then
+            echo "Building api image..."
+            nix build .#image-api -L
+            mv result result-api
+            echo "api" >> .apps-built
+          fi
+
+          # If no apps changed, note it
+          if [ ! -f .apps-built ]; then
+            echo "No apps changed, skipping image builds"
+            touch .apps-built
+          fi
+
+      # Upload build artifacts for the push job
+      # This passes the Nix-built images to the next job
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-images
+          path: |
+            result-*
+            .apps-built
+          retention-days: 1
+
+  # Job 2: Push images to registry (only on main branch)
+  push:
+    name: Push Images
+    needs: build
+    # Only push images on main branch (not on PRs)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    # Permissions needed for pushing to GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download the images built in the previous job
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nix-images
+
+      # Install skopeo for OCI image operations (no Docker needed!)
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      # Login to GitHub Container Registry
+      # Uses the built-in GITHUB_TOKEN for authentication
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            skopeo login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Push images to registry and save digests
+      # The digest is used for deployment to ensure we deploy the exact image
+      - name: Push images
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          TAG: ${{ github.sha }}
+        run: |
+          mkdir -p digests
+
+          # Read which apps were built
+          if [ -f .apps-built ] && [ -s .apps-built ]; then
+            while read -r app; do
+              if [ -f "result-$app" ]; then
+                echo "Pushing $app image..."
+                IMAGE="$REGISTRY/nix-sample-$app:$TAG"
+
+                # Copy image to registry
+                skopeo copy \
+                  --dest-compress \
+                  docker-archive:result-$app \
+                  docker://$IMAGE
+
+                # Also tag as 'latest'
+                skopeo copy \
+                  docker://$IMAGE \
+                  docker://$REGISTRY/nix-sample-$app:latest
+
+                # Save digest for deployment
+                DIGEST=$(skopeo inspect docker://$IMAGE | jq -r .Digest)
+                echo "$DIGEST" > digests/$app.txt
+                echo "✅ $app: $DIGEST"
+              fi
+            done < .apps-built
+          else
+            echo "No images to push"
+          fi
+
+      # Upload digests as artifacts
+      # These can be used by deployment workflows to deploy the exact image
+      - name: Upload digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digests
+          path: digests/
+          retention-days: 30
+
+  # Optional: Job 3 - Deploy (example)
+  # Uncomment and customize for your deployment target
+  # deploy:
+  #   name: Deploy to Production
+  #   needs: push
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Download digests
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: image-digests
+  #
+  #     - name: Deploy to ECS/K8s/etc
+  #       run: |
+  #         WEB_DIGEST=$(cat web.txt)
+  #         API_DIGEST=$(cat api.txt)
+  #         # Use these digests with your deployment tool
+  #         # terraform apply -var="web_image=$REGISTRY/nix-sample-web@$WEB_DIGEST"
