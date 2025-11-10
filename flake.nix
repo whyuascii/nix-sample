@@ -13,7 +13,7 @@
     devenv.url = "github:cachix/devenv";
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-utils, devenv, ... }:
+  outputs = { self, nixpkgs, flake-utils, devenv, ... }@inputs:
     # Generate outputs for all default systems (x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin)
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -107,12 +107,11 @@
         # Enter with: nix develop .#dev-web or via direnv
 
         devShells.dev-web = devenv.lib.mkShell {
-          inherit pkgs;
+          inherit inputs pkgs;
           modules = [
-            ({ pkgs, ... }: {
+            ({ pkgs, config, lib, ... }: {
               # Configure devenv to use our repo root for state
               devenv.root = repoRoot;
-              devenv.state = "${repoRoot}/.devenv";
 
               # Install all Node.js tools
               packages = nodeTools;
@@ -135,11 +134,10 @@
         };
 
         devShells.dev-api = devenv.lib.mkShell {
-          inherit pkgs;
+          inherit inputs pkgs;
           modules = [
-            ({ pkgs, ... }: {
+            ({ pkgs, config, lib, ... }: {
               devenv.root = repoRoot;
-              devenv.state = "${repoRoot}/.devenv";
               packages = nodeTools;
               env = {
                 NODE_ENV = "development";
@@ -157,11 +155,10 @@
 
         # Default shell (for general monorepo work)
         devShells.default = devenv.lib.mkShell {
-          inherit pkgs;
+          inherit inputs pkgs;
           modules = [
-            ({ pkgs, ... }: {
+            ({ pkgs, config, lib, ... }: {
               devenv.root = repoRoot;
-              devenv.state = "${repoRoot}/.devenv";
               packages = nodeTools;
               env = {
                 NODE_ENV = "development";
