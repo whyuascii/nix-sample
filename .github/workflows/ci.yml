@@ -7,7 +7,7 @@
 # - Generating image digests for deployment
 #
 # Key Features:
-# - Fast: Uses Turborepo caching and Nix binary cache
+# - Fast: Uses unified caching strategy (actions/cache) for Nix, Turborepo, and pnpm
 # - Deterministic: Nix ensures reproducible builds
 # - Docker-free: Uses skopeo for OCI image operations
 # - Secure: Uses GITHUB_TOKEN for registry authentication
@@ -43,19 +43,30 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v13
 
-      # Optional: Enable Nix binary cache for faster builds
-      # This caches Nix build artifacts to speed up subsequent builds
+      # Enable Nix binary cache for faster builds
+      # This caches Nix build artifacts across workflow runs
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@v7
 
+      # Cache pnpm store for faster dependency installation
+      # Uses actions/cache for consistency with other caching
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
       # Cache Turborepo build artifacts
       # This speeds up builds by reusing previous build outputs
-      - name: Cache Turbo
+      - name: Cache Turborepo
         uses: actions/cache@v4
         with:
           path: .turbo
-          key: ${{ runner.os }}-turbo-${{ hashFiles('**/package.json', '**/pnpm-lock.yaml') }}
+          key: ${{ runner.os }}-turbo-${{ hashFiles('**/package.json', '**/pnpm-lock.yaml') }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-turbo-${{ hashFiles('**/package.json', '**/pnpm-lock.yaml') }}-
             ${{ runner.os }}-turbo-
 
       # Install pnpm globally
@@ -99,36 +110,37 @@ jobs:
           # Detect which apps changed and build their images
           echo "Detecting changed apps..."
 
+          # Create directory for images
+          mkdir -p nix-images
+
           if git diff --name-only origin/${{ github.base_ref || 'main' }}...HEAD | grep -q '^apps/web/'; then
             echo "Building web image..."
             nix build .#image-web -L
-            mv result result-web
-            echo "web" >> .apps-built
+            mv result nix-images/result-web
+            echo "web" >> nix-images/.apps-built
           fi
 
           if git diff --name-only origin/${{ github.base_ref || 'main' }}...HEAD | grep -q '^apps/api/'; then
             echo "Building api image..."
             nix build .#image-api -L
-            mv result result-api
-            echo "api" >> .apps-built
+            mv result nix-images/result-api
+            echo "api" >> nix-images/.apps-built
           fi
 
           # If no apps changed, note it
-          if [ ! -f .apps-built ]; then
+          if [ ! -f nix-images/.apps-built ]; then
             echo "No apps changed, skipping image builds"
-            touch .apps-built
+            touch nix-images/.apps-built
           fi
 
-      # Upload build artifacts for the push job
-      # This passes the Nix-built images to the next job
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      # Cache built images for the push job
+      # Uses actions/cache instead of artifacts for better performance
+      # Cache key includes SHA to ensure each commit gets its own cache entry
+      - name: Cache built images
+        uses: actions/cache/save@v4
         with:
-          name: nix-images
-          path: |
-            result-*
-            .apps-built
-          retention-days: 1
+          path: nix-images/
+          key: nix-images-${{ github.sha }}
 
   # Job 2: Push images to registry (only on main branch)
   push:
@@ -147,11 +159,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Download the images built in the previous job
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      # Restore the cached images from the build job
+      # Uses actions/cache instead of download-artifact
+      - name: Restore built images
+        uses: actions/cache/restore@v4
         with:
-          name: nix-images
+          path: nix-images/
+          key: nix-images-${{ github.sha }}
 
       # Install skopeo for OCI image operations (no Docker needed!)
       - name: Install skopeo
@@ -176,16 +190,16 @@ jobs:
           mkdir -p digests
 
           # Read which apps were built
-          if [ -f .apps-built ] && [ -s .apps-built ]; then
+          if [ -f nix-images/.apps-built ] && [ -s nix-images/.apps-built ]; then
             while read -r app; do
-              if [ -f "result-$app" ]; then
+              if [ -f "nix-images/result-$app" ]; then
                 echo "Pushing $app image..."
                 IMAGE="$REGISTRY/nix-sample-$app:$TAG"
 
                 # Copy image to registry
                 skopeo copy \
                   --dest-compress \
-                  docker-archive:result-$app \
+                  docker-archive:nix-images/result-$app \
                   docker://$IMAGE
 
                 # Also tag as 'latest'
@@ -198,19 +212,19 @@ jobs:
                 echo "$DIGEST" > digests/$app.txt
                 echo "✅ $app: $DIGEST"
               fi
-            done < .apps-built
+            done < nix-images/.apps-built
           else
             echo "No images to push"
           fi
 
-      # Upload digests as artifacts
+      # Cache digests for deployment job
       # These can be used by deployment workflows to deploy the exact image
-      - name: Upload digests
-        uses: actions/upload-artifact@v4
+      - name: Cache image digests
+        if: hashFiles('digests/*') != ''
+        uses: actions/cache/save@v4
         with:
-          name: image-digests
           path: digests/
-          retention-days: 30
+          key: image-digests-${{ github.sha }}
 
   # Optional: Job 3 - Deploy (example)
   # Uncomment and customize for your deployment target
@@ -219,14 +233,15 @@ jobs:
   #   needs: push
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - name: Download digests
-  #       uses: actions/download-artifact@v4
+  #     - name: Restore image digests
+  #       uses: actions/cache/restore@v4
   #       with:
-  #         name: image-digests
+  #         path: digests/
+  #         key: image-digests-${{ github.sha }}
   #
   #     - name: Deploy to ECS/K8s/etc
   #       run: |
-  #         WEB_DIGEST=$(cat web.txt)
-  #         API_DIGEST=$(cat api.txt)
+  #         WEB_DIGEST=$(cat digests/web.txt)
+  #         API_DIGEST=$(cat digests/api.txt)
   #         # Use these digests with your deployment tool
   #         # terraform apply -var="web_image=$REGISTRY/nix-sample-web@$WEB_DIGEST"

@@ -957,10 +957,11 @@ nix-collect-garbage                      # Clean Nix store (frees disk space)
 -   [devenv Guide](https://devenv.sh/) - devenv documentation
 -   [skopeo](https://github.com/containers/skopeo) - skopeo documentation
 
-### Community
+---
 
--   [Nix Discourse](https://discourse.nixos.org/) - Official forum
--   [NixOS Wiki](https://wiki.nixos.org/) - Community wiki
--   [r/NixOS](https://reddit.com/r/NixOS) - Reddit community
+### Fun Videos
+
+-   [NixOS: Everything Everywhere All At Once](https://youtu.be/CwfKlX3rA6E?si=aW4feNT2ay92cdFh)
+-   [NixOS Explained](https://youtu.be/9OMDnZWXjn4?si=_B1y1twEvgxEY4O3)
 
 ---
