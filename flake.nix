@@ -13,7 +13,7 @@
     devenv.url = "github:cachix/devenv";
   };
 
-  outputs = { self, nixpkgs, flake-utils, devenv, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-utils, devenv, ... }:
     # Generate outputs for all default systems (x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin)
     flake-utils.lib.eachDefaultSystem (system:
       let
